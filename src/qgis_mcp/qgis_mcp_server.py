@@ -10,16 +10,17 @@ import json
 from typing import AsyncIterator, Dict, Any
 from mcp.server.fastmcp import FastMCP, Context
 
-logging.basicConfig(level=logging.INFO, 
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("QgisMCPServer")
+
 
 class QgisMCPServer:
     def __init__(self, host='localhost', port=9876):
         self.host = host
         self.port = port
         self.socket = None
-    
+
     def connect(self):
         """Connect to the QGIS MCP server"""
         try:
@@ -29,57 +30,74 @@ class QgisMCPServer:
         except Exception as e:
             print(f"Error connecting to server: {str(e)}")
             return False
-    
+
     def disconnect(self):
         """Disconnect from the server"""
         if self.socket:
             self.socket.close()
             self.socket = None
-    
+
     def send_command(self, command_type, params=None):
         """Send a command to the server and get the response"""
         if not self.socket:
             print("Not connected to server")
             return None
-        
+
         # Create command
         command = {
             "type": command_type,
             "params": params or {}
         }
-        
+
         try:
             # Send the command
             self.socket.sendall(json.dumps(command).encode('utf-8'))
-            
+
+            # Set a receive timeout to avoid infinite waiting.
+            self.socket.settimeout(30)  # 30 seconds timeout
+
             # Receive the response
             response_data = b''
             while True:
-                chunk = self.socket.recv(4096)
+                chunk = self.socket.recv(65536)  # Use a larger buffer
                 if not chunk:
                     break
                 response_data += chunk
-                
+
                 # Try to decode as JSON to see if it's complete
                 try:
                     json.loads(response_data.decode('utf-8'))
                     break  # Valid JSON, we have the full message
                 except json.JSONDecodeError:
                     continue  # Keep receiving
-            
+
+            # Restore to no timeout
+            self.socket.settimeout(None)
+
             # Parse and return the response
-            return json.loads(response_data.decode('utf-8'))
-            
+            if not response_data:
+                return {"status": "error", "message": "Empty response from server"}
+
+            try:
+                return json.loads(response_data.decode('utf-8'))
+            except json.JSONDecodeError as e:
+                return {"status": "error", "message": f"Invalid JSON response: {str(e)}"}
+
+        except socket.timeout:
+            print(f"Socket operation timed out after 30 seconds")
+            return {"status": "error", "message": "Connection timed out"}
         except Exception as e:
             print(f"Error sending command: {str(e)}")
-            return None
+            return {"status": "error", "message": str(e), "response_data": response_data.decode('utf-8', errors='replace')}
+
 
 _qgis_connection = None
+
 
 def get_qgis_connection():
     """Get or create a persistent Qgis connection"""
     global _qgis_connection
-    
+
     # If we have an existing connection, check if it's still valid
     if _qgis_connection is not None:
         # Test if the connection is still alive with a simple ping
@@ -95,28 +113,30 @@ def get_qgis_connection():
             except Exception:
                 pass
             _qgis_connection = None
-    
+
     # Create a new connection if needed
     if _qgis_connection is None:
         _qgis_connection = QgisMCPServer(host="localhost", port=9876)
         if not _qgis_connection.connect():
             logger.error("Failed to connect to Qgis")
             _qgis_connection = None
-            raise Exception("Could not connect to Qgis. Make sure the Qgis plugin is running.")
+            raise Exception(
+                "Could not connect to Qgis. Make sure the Qgis plugin is running.")
         logger.info("Created new persistent connection to Qgis")
-    
+
     return _qgis_connection
+
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     """Manage server startup and shutdown lifecycle"""
     # We don't need to create a connection here since we're using the global connection
     # for resources and tools
-    
+
     try:
         # Just log that we're starting up
         logger.info("QgisMCPServer server starting up")
-        
+
         # Try to connect to Qgis on startup to verify it's available
         try:
             # This will initialize the global connection if needed
@@ -124,8 +144,9 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
             logger.info("Successfully connected to Qgis on startup")
         except Exception as e:
             logger.warning(f"Could not connect to Qgis on startup: {str(e)}")
-            logger.warning("Make sure the Qgis addon is running before using Qgis resources or tools")
-        
+            logger.warning(
+                "Make sure the Qgis addon is running before using Qgis resources or tools")
+
         # Return an empty context - we're using the global connection
         yield {}
     finally:
@@ -138,10 +159,11 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         logger.info("QgisMCPServer server shut down")
 
 mcp = FastMCP(
-    "Qgis_mcp",
-    description="Qgis integration through the Model Context Protocol",
+    name="Qgis_mcp",
+    instructions="Qgis integration through the Model Context Protocol",
     lifespan=server_lifespan
 )
+
 
 @mcp.tool()
 def ping(ctx: Context) -> str:
@@ -150,12 +172,14 @@ def ping(ctx: Context) -> str:
     result = qgis.send_command("ping")
     return json.dumps(result, indent=2)
 
+
 @mcp.tool()
 def get_qgis_info(ctx: Context) -> str:
     """Get QGIS information"""
     qgis = get_qgis_connection()
     result = qgis.send_command("get_qgis_info")
     return json.dumps(result, indent=2)
+
 
 @mcp.tool()
 def load_project(ctx: Context, path: str) -> str:
@@ -164,6 +188,7 @@ def load_project(ctx: Context, path: str) -> str:
     result = qgis.send_command("load_project", {"path": path})
     return json.dumps(result, indent=2)
 
+
 @mcp.tool()
 def create_new_project(ctx: Context, path: str) -> str:
     """Create a new project a save it"""
@@ -171,12 +196,14 @@ def create_new_project(ctx: Context, path: str) -> str:
     result = qgis.send_command("create_new_project", {"path": path})
     return json.dumps(result, indent=2)
 
+
 @mcp.tool()
 def get_project_info(ctx: Context) -> str:
     """Get current project information"""
     qgis = get_qgis_connection()
     result = qgis.send_command("get_project_info")
     return json.dumps(result, indent=2)
+
 
 @mcp.tool()
 def add_vector_layer(ctx: Context, path: str, provider: str = "ogr", name: str = None) -> str:
@@ -188,6 +215,7 @@ def add_vector_layer(ctx: Context, path: str, provider: str = "ogr", name: str =
     result = qgis.send_command("add_vector_layer", params)
     return json.dumps(result, indent=2)
 
+
 @mcp.tool()
 def add_raster_layer(ctx: Context, path: str, provider: str = "gdal", name: str = None) -> str:
     """Add a raster layer to the project."""
@@ -198,12 +226,14 @@ def add_raster_layer(ctx: Context, path: str, provider: str = "gdal", name: str 
     result = qgis.send_command("add_raster_layer", params)
     return json.dumps(result, indent=2)
 
+
 @mcp.tool()
 def get_layers(ctx: Context) -> str:
     """Retrieve all layers in the current project."""
     qgis = get_qgis_connection()
     result = qgis.send_command("get_layers")
     return json.dumps(result, indent=2)
+
 
 @mcp.tool()
 def remove_layer(ctx: Context, layer_id: str) -> str:
@@ -212,6 +242,7 @@ def remove_layer(ctx: Context, layer_id: str) -> str:
     result = qgis.send_command("remove_layer", {"layer_id": layer_id})
     return json.dumps(result, indent=2)
 
+
 @mcp.tool()
 def zoom_to_layer(ctx: Context, layer_id: str) -> str:
     """Zoom to the extent of a specified layer."""
@@ -219,18 +250,24 @@ def zoom_to_layer(ctx: Context, layer_id: str) -> str:
     result = qgis.send_command("zoom_to_layer", {"layer_id": layer_id})
     return json.dumps(result, indent=2)
 
+
 @mcp.tool()
-def get_layer_features(ctx: Context, layer_id: str, limit: int = 10) -> str:
-    """Retrieve features from a vector layer with an optional limit."""
+def get_layer_features(ctx: Context, layer_id: str, limit: int = 3, include_geometry: bool = False) -> str:
+    """Retrieve features from a vector layer with an optional limit(max 3 items)."""
     qgis = get_qgis_connection()
-    result = qgis.send_command("get_layer_features", {"layer_id": layer_id, "limit": limit})
+    if limit > 3:
+        limit = 3  # Enforce a maximum limit of 3 to avoid large data transfers
+    result = qgis.send_command("get_layer_features", {
+                               "layer_id": layer_id, "limit": limit, "include_geometry": include_geometry})
     return json.dumps(result, indent=2)
+
 
 @mcp.tool()
 def execute_processing(ctx: Context, algorithm: str, parameters: dict) -> str:
     """Execute a processing algorithm with the given parameters."""
     qgis = get_qgis_connection()
-    result = qgis.send_command("execute_processing", {"algorithm": algorithm, "parameters": parameters})
+    result = qgis.send_command("execute_processing", {
+                               "algorithm": algorithm, "parameters": parameters})
     return json.dumps(result, indent=2)
 
 
@@ -249,7 +286,8 @@ def save_project(ctx: Context, path: str = None) -> str:
 def render_map(ctx: Context, path: str, width: int = 800, height: int = 600) -> str:
     """Render the current map view to an image file with the specified dimensions."""
     qgis = get_qgis_connection()
-    result = qgis.send_command("render_map", {"path": path, "width": width, "height": height})
+    result = qgis.send_command(
+        "render_map", {"path": path, "width": width, "height": height})
     return json.dumps(result, indent=2)
 
 
@@ -261,10 +299,5 @@ def execute_code(ctx: Context, code: str) -> str:
     return json.dumps(result, indent=2)
 
 
-
-def main():
-    """Run the MCP server"""
-    mcp.run()
-
 if __name__ == "__main__":
-    main()
+    mcp.run()
