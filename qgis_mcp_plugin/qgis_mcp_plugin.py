@@ -417,8 +417,10 @@ class QgisMCPServer(QObject):
                 "visible": self._is_layer_visible(layer_id)
             }
 
-            # Add type-specific information
-            if layer.type() == _VectorLayerType:
+            # Add type-specific information (skip expensive calls on invalid layers)
+            if not layer.isValid():
+                layer_info["valid"] = False
+            elif layer.type() == _VectorLayerType:
                 layer_info.update({
                     "feature_count": layer.featureCount(),
                     "geometry_type": layer.geometryType()
