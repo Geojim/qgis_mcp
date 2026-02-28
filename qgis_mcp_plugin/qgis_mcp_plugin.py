@@ -229,6 +229,8 @@ class QgisMCPServer(QObject):
         layer = self._get_layer(layer_id)
         if layer.type() != _VectorLayerType:
             raise Exception(f"Layer is not a vector layer: {layer_id}")
+        if not layer.isValid():
+            raise Exception(f"Layer data source is unavailable: {layer_id} ({layer.name()})")
         return layer
 
     def _get_layer_type(self, layer):
