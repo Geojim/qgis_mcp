@@ -6,10 +6,29 @@ import socket
 import traceback
 from qgis.core import *
 from qgis.gui import *
-from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer, Qt, QSize, QVariant
+from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer, Qt, QSize
+try:
+    from qgis.PyQt.QtCore import QVariant
+    HAS_QVARIANT = True
+except ImportError:
+    HAS_QVARIANT = False
 from qgis.PyQt.QtWidgets import QAction, QDockWidget, QVBoxLayout, QLabel, QPushButton, QSpinBox, QWidget
 from qgis.PyQt.QtGui import QIcon, QColor
 from qgis.utils import active_plugins
+
+# Qt5/Qt6 compatible enum values
+try:
+    _RightDockWidgetArea = Qt.DockWidgetArea.RightDockWidgetArea  # Qt6
+except AttributeError:
+    _RightDockWidgetArea = Qt.RightDockWidgetArea  # Qt5
+
+# QGIS 3.30+ scoped enums with fallback for older versions
+try:
+    _VectorLayerType = Qgis.LayerType.Vector
+    _RasterLayerType = Qgis.LayerType.Raster
+except AttributeError:
+    _VectorLayerType = QgsMapLayer.VectorLayer
+    _RasterLayerType = QgsMapLayer.RasterLayer
 
 
 class QgisMCPServer(QObject):
@@ -159,6 +178,11 @@ class QgisMCPServer(QObject):
                 "save_project": self.save_project,
                 "render_map": self.render_map,
                 "create_new_project": self.create_new_project,
+                "set_layer_visibility": self.set_layer_visibility,
+                "filter_layer": self.filter_layer,
+                "get_layer_fields": self.get_layer_fields,
+                "group_layers": self.group_layers,
+                "select_features": self.select_features,
             }
 
             handler = handlers.get(cmd_type)
@@ -184,7 +208,63 @@ class QgisMCPServer(QObject):
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
 
-    # Command handlers
+    # --- Helpers ---
+
+    def _is_layer_visible(self, layer_id):
+        """Check if a layer is visible in the layer tree (Qt5/Qt6 safe)."""
+        node = QgsProject.instance().layerTreeRoot().findLayer(layer_id)
+        if node is None:
+            return False
+        return node.isVisible()
+
+    def _get_layer(self, layer_id):
+        """Look up any layer by ID, raise if not found."""
+        project = QgsProject.instance()
+        if layer_id not in project.mapLayers():
+            raise Exception(f"Layer not found: {layer_id}")
+        return project.mapLayer(layer_id)
+
+    def _get_vector_layer(self, layer_id):
+        """Look up a vector layer by ID, raise if not found or wrong type."""
+        layer = self._get_layer(layer_id)
+        if layer.type() != _VectorLayerType:
+            raise Exception(f"Layer is not a vector layer: {layer_id}")
+        return layer
+
+    def _get_layer_type(self, layer):
+        """Helper to get layer type as string"""
+        if layer.type() == _VectorLayerType:
+            return f"vector_{layer.geometryType()}"
+        elif layer.type() == _RasterLayerType:
+            return "raster"
+        else:
+            return str(layer.type())
+
+    @staticmethod
+    def _convert_to_python_type(value):
+        """Convert a value to a JSON-serializable Python type.
+
+        Handles QVariant (Qt5) and native Python types (Qt6) transparently.
+        """
+        if HAS_QVARIANT and isinstance(value, QVariant):
+            if value.isNull():
+                return None
+            value = value.value()
+        if value is None:
+            return None
+        if isinstance(value, (int, float, str, bool)):
+            return value
+        if hasattr(value, 'toPyDate'):  # QDate
+            return value.toPyDate().isoformat()
+        if hasattr(value, 'toPyDateTime'):  # QDateTime
+            return value.toPyDateTime().isoformat()
+        try:
+            return str(value)
+        except Exception:
+            return None
+
+    # --- Command handlers ---
+
     def ping(self, **kwargs):
         """Simple ping command"""
         return {"pong": True}
@@ -220,43 +300,11 @@ class QgisMCPServer(QObject):
                 "id": layer.id(),
                 "name": layer.name(),
                 "type": self._get_layer_type(layer),
-                "visible": layer.isValid() and project.layerTreeRoot().findLayer(layer.id()).isVisible()
+                "visible": layer.isValid() and self._is_layer_visible(layer.id())
             }
             info["layers"].append(layer_info)
 
         return info
-
-    def _get_layer_type(self, layer):
-        """Helper to get layer type as string"""
-        if layer.type() == QgsMapLayer.VectorLayer:
-            return f"vector_{layer.geometryType()}"
-        elif layer.type() == QgsMapLayer.RasterLayer:
-            return "raster"
-        else:
-            return str(layer.type())
-
-    def _convert_to_python_type(self, qvariant):
-        """Convert QVariant to Python's native type for JSON serialization"""
-        if qvariant.isNull():
-            return None
-
-        # In QGIS 3.x, we can directly use QVariant.value() to get the Python value
-        value = qvariant.value()
-
-        # Handle basic types
-        if isinstance(value, (int, float, str, bool, type(None))):
-            return value
-        # Handle date and time types
-        elif hasattr(value, 'toPyDate'):  # QDate
-            return value.toPyDate().isoformat()
-        elif hasattr(value, 'toPyDateTime'):  # QDateTime
-            return value.toPyDateTime().isoformat()
-        # Handle other types
-        else:
-            try:
-                return str(value)
-            except:
-                return None
 
     def execute_code(self, code, **kwargs):
         """Execute arbitrary PyQGIS code"""
@@ -366,16 +414,16 @@ class QgisMCPServer(QObject):
                 "id": layer_id,
                 "name": layer.name(),
                 "type": self._get_layer_type(layer),
-                "visible": project.layerTreeRoot().findLayer(layer_id).isVisible()
+                "visible": self._is_layer_visible(layer_id)
             }
 
             # Add type-specific information
-            if layer.type() == QgsMapLayer.VectorLayer:
+            if layer.type() == _VectorLayerType:
                 layer_info.update({
                     "feature_count": layer.featureCount(),
                     "geometry_type": layer.geometryType()
                 })
-            elif layer.type() == QgsMapLayer.RasterLayer:
+            elif layer.type() == _RasterLayerType:
                 layer_info.update({
                     "width": layer.width(),
                     "height": layer.height()
@@ -409,129 +457,58 @@ class QgisMCPServer(QObject):
 
     def get_layer_features(self, layer_id, limit=10, include_geometry=False, **kwargs):
         """Get features from a vector layer with optimized data size
-        
+
         Args:
             layer_id: The ID of the layer to get features from
             limit: Maximum number of features to return (default: 10)
             include_geometry: Whether to include geometry data (default: False)
         """
-        project = QgsProject.instance()
+        layer = self._get_vector_layer(layer_id)
 
-        if layer_id in project.mapLayers():
-            layer = project.mapLayer(layer_id)
+        features = []
 
-            if layer.type() != QgsMapLayer.VectorLayer:
-                raise Exception(f"Layer is not a vector layer: {layer_id}")
+        # Get field names first for the response
+        field_names = [field.name() for field in layer.fields()]
 
-            features = []
+        # Always get feature count for metadata
+        feature_count = layer.featureCount()
 
-            # Get field names first for the response
-            field_names = [field.name() for field in layer.fields()]
+        # Get the actual features
+        for i, feature in enumerate(layer.getFeatures()):
+            if i >= limit:
+                break
 
-            # Always get feature count for metadata
-            feature_count = layer.featureCount()
+            # Extract attributes using the Qt5/Qt6-safe converter
+            attrs = {}
+            for field in layer.fields():
+                attrs[field.name()] = self._convert_to_python_type(
+                    feature.attribute(field.name())
+                )
 
-            # Get the actual features
-            for i, feature in enumerate(layer.getFeatures()):
-                if i >= limit:
-                    break
-
-                # Extract attributes
-                attrs = {}
-                for field in layer.fields():
-                    # Get attribute value and ensure it can be JSON serialized
-                    value = feature.attribute(field.name())
-                    if isinstance(value, QVariant):
-                        attrs[field.name()] = self._convert_to_python_type(value)
-                    else:
-                        # Directly handle non-QVariant types
-                        if isinstance(value, (int, float, str, bool, type(None))):
-                            attrs[field.name()] = value
-                        else:
-                            # For other complex types, convert to string
-                            try:
-                                attrs[field.name()] = str(value)
-                            except:
-                                attrs[field.name()] = None
-
-                # Create feature object with just the attributes by default
-                feature_obj = {
-                    "id": feature.id(),
-                    "attributes": attrs,
-                }
-
-                # Only include geometry if explicitly requested
-                if include_geometry and feature.hasGeometry():
-                    # Use a simplified geometry representation
-                    geom = feature.geometry()
-
-                    # Check if QgsWkbTypes is available, fallback to using geom.type() if not
-                    geom_type = geom.type()
-
-                    try:
-                        # Try to get WKB type name
-                        from qgis.core import QgsWkbTypes
-                        wkb_type_name = QgsWkbTypes.displayString(
-                            geom.wkbType())
-
-                        # For polygons and lines, we can reduce precision and simplify
-                        if geom_type in [QgsWkbTypes.PolygonGeometry, QgsWkbTypes.LineGeometry]:
-                            simplified_geom = geom.simplify(0.001)  # Simplify with tolerance
-                            points_count = len(
-                                simplified_geom.asWkt().split(','))
-
-                            geom_obj = {
-                                "type": geom_type,
-                                "wkb_type": wkb_type_name,
-                                "wkt_summary": f"{wkb_type_name} with {points_count} points",
-                                "bbox": [
-                                    geom.boundingBox().xMinimum(),
-                                    geom.boundingBox().yMinimum(),
-                                    geom.boundingBox().xMaximum(),
-                                    geom.boundingBox().yMaximum()
-                                ]
-                            }
-                        else:  # For points, we can include full geometry
-                            geom_obj = {
-                                "type": geom_type,
-                                "wkb_type": wkb_type_name,
-                                "wkt": geom.asWkt(precision=3)  # Reduce precision
-                            }
-                    except ImportError:
-                        # If QgsWkbTypes is not available, use a simple fallback method
-                        geom_obj = {
-                            "type": geom_type,
-                            "bbox": [
-                                geom.boundingBox().xMinimum(),
-                                geom.boundingBox().yMinimum(),
-                                geom.boundingBox().xMaximum(),
-                                geom.boundingBox().yMaximum()
-                            ] if hasattr(geom, 'boundingBox') else None,
-                            "wkt": geom.asWkt(precision=3)  # 减少精度
-                        }
-
-                    feature_obj["geometry"] = geom_obj
-
-                features.append(feature_obj)
-
-            # Prepare the response with metadata and sample data
-            response = {
-                "layer_id": layer_id,
-                "layer_name": layer.name(),
-                "feature_count": feature_count,
-                "fields": field_names,
-                "features": features,
-                "geometry_included": include_geometry,
-                "note": "Geometry data is omitted by default. Pass include_geometry=True to include it."
+            # Create feature object with just the attributes by default
+            feature_obj = {
+                "id": feature.id(),
+                "attributes": attrs,
             }
 
-            # Add example of how to request with geometry
-            if not include_geometry:
-                response["geometry_note"] = "To include geometry data, use: get_layer_features with include_geometry=True"
+            # Only include geometry if explicitly requested
+            if include_geometry and feature.hasGeometry():
+                geom = feature.geometry()
+                feature_obj["geometry"] = {
+                    "type": geom.type(),
+                    "wkt": geom.asWkt(precision=4)
+                }
 
-            return response
-        else:
-            raise Exception(f"Layer not found: {layer_id}")
+            features.append(feature_obj)
+
+        return {
+            "layer_id": layer_id,
+            "layer_name": layer.name(),
+            "feature_count": feature_count,
+            "fields": field_names,
+            "features": features,
+            "geometry_included": include_geometry,
+        }
 
     def execute_processing(self, algorithm, parameters, **kwargs):
         """Execute a processing algorithm"""
@@ -577,7 +554,7 @@ class QgisMCPServer(QObject):
         """
         Creates a new QGIS project and saves it at the specified path.
         If a project is already loaded, it clears it before creating the new one.
-        
+
         :param project_path: Full path where the project will be saved
                             (e.g., 'C:/path/to/project.qgz')
         """
@@ -598,14 +575,121 @@ class QgisMCPServer(QObject):
         else:
             raise Exception(f"Failed to save project to {path}")
 
+    def set_layer_visibility(self, layer_id, visible, **kwargs):
+        """Toggle layer visibility on/off"""
+        layer = self._get_layer(layer_id)
+        node = QgsProject.instance().layerTreeRoot().findLayer(layer_id)
+        if node is None:
+            raise Exception(f"Layer tree node not found: {layer_id}")
+        node.setItemVisibilityChecked(visible)
+        self.iface.mapCanvas().refresh()
+        return {"layer_id": layer_id, "layer_name": layer.name(), "visible": visible}
+
+    def filter_layer(self, layer_id, expression="", **kwargs):
+        """Set a subset filter (SQL WHERE clause) on a vector layer"""
+        layer = self._get_vector_layer(layer_id)
+        previous_expression = layer.subsetString()
+        if not layer.setSubsetString(expression):
+            provider_error = ""
+            if layer.dataProvider():
+                provider_error = layer.dataProvider().error().message()
+            detail = f": {provider_error}" if provider_error else ""
+            raise Exception(f"Invalid filter expression: {expression}{detail}")
+        return {
+            "layer_id": layer_id,
+            "layer_name": layer.name(),
+            "expression": expression,
+            "previous_expression": previous_expression,
+            "feature_count": layer.featureCount(),
+        }
+
+    def get_layer_fields(self, layer_id, **kwargs):
+        """Get field metadata for a vector layer"""
+        layer = self._get_vector_layer(layer_id)
+        fields = []
+        for field in layer.fields():
+            fields.append({
+                "name": field.name(),
+                "type": field.typeName(),
+                "length": field.length(),
+                "precision": field.precision(),
+                "comment": field.comment(),
+            })
+        return {
+            "layer_id": layer_id,
+            "layer_name": layer.name(),
+            "feature_count": layer.featureCount(),
+            "crs": layer.crs().authid(),
+            "fields": fields,
+        }
+
+    def group_layers(self, name, layer_ids, **kwargs):
+        """Create a layer group and move layers into it"""
+        project = QgsProject.instance()
+        root = project.layerTreeRoot()
+        group = root.addGroup(name)
+        moved = []
+        skipped = []
+        for lid in layer_ids:
+            layer = project.mapLayer(lid)
+            if not layer:
+                skipped.append(lid)
+                continue
+            group.addLayer(layer)
+            # Remove old node from its parent
+            old_node = root.findLayer(lid)
+            if old_node is not None and old_node.parent() is not None:
+                old_node.parent().removeChildNode(old_node)
+            moved.append(lid)
+        return {"group": name, "moved_layers": moved, "skipped_layers": skipped}
+
+    def select_features(self, layer_id, expression="", mode="set", **kwargs):
+        """Select features by expression, or clear selection if empty.
+
+        Args:
+            mode: One of 'set' (default), 'add', 'remove', 'intersect'.
+        """
+        layer = self._get_vector_layer(layer_id)
+        if expression:
+            # Map mode string to QgsVectorLayer.SelectBehavior enum (Qt5/Qt6 compat)
+            try:
+                behavior_map = {
+                    "set": QgsVectorLayer.SelectBehavior.SetSelection,
+                    "add": QgsVectorLayer.SelectBehavior.AddToSelection,
+                    "remove": QgsVectorLayer.SelectBehavior.RemoveFromSelection,
+                    "intersect": QgsVectorLayer.SelectBehavior.IntersectSelection,
+                }
+            except AttributeError:
+                behavior_map = {
+                    "set": QgsVectorLayer.SetSelection,
+                    "add": QgsVectorLayer.AddToSelection,
+                    "remove": QgsVectorLayer.RemoveFromSelection,
+                    "intersect": QgsVectorLayer.IntersectSelection,
+                }
+            behavior = behavior_map.get(mode)
+            if behavior is None:
+                raise Exception(f"Invalid selection mode: {mode}. Use one of: set, add, remove, intersect")
+            layer.selectByExpression(expression, behavior)
+        else:
+            layer.removeSelection()
+        selected_ids = layer.selectedFeatureIds()
+        return {
+            "layer_id": layer_id,
+            "layer_name": layer.name(),
+            "expression": expression,
+            "mode": mode,
+            "selected_count": layer.selectedFeatureCount(),
+            "selected_ids": list(selected_ids[:100]),
+        }
+
     def render_map(self, path, width=800, height=600, **kwargs):
         """Render the current map view to an image"""
         try:
             # Create map settings
             ms = QgsMapSettings()
 
-            # Set layers to render
-            layers = list(QgsProject.instance().mapLayers().values())
+            # Set layers to render (only visible layers)
+            layers = QgsProject.instance().layerTreeRoot().checkedLayers()
             ms.setLayers(layers)
 
             # Set map canvas properties
@@ -740,7 +824,7 @@ class QgisMCPPlugin:
             if not self.dock_widget:
                 self.dock_widget = QgisMCPDockWidget(self.iface)
                 self.iface.addDockWidget(
-                    Qt.RightDockWidgetArea, self.dock_widget)
+                    _RightDockWidgetArea, self.dock_widget)
                 # Connect close event
                 self.dock_widget.closed.connect(self.dock_closed)
             else:

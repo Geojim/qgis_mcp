@@ -130,16 +130,11 @@ def get_qgis_connection():
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     """Manage server startup and shutdown lifecycle"""
-    # We don't need to create a connection here since we're using the global connection
-    # for resources and tools
-
     try:
-        # Just log that we're starting up
         logger.info("QgisMCPServer server starting up")
 
         # Try to connect to Qgis on startup to verify it's available
         try:
-            # This will initialize the global connection if needed
             qgis = get_qgis_connection()
             logger.info("Successfully connected to Qgis on startup")
         except Exception as e:
@@ -147,10 +142,8 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
             logger.warning(
                 "Make sure the Qgis addon is running before using Qgis resources or tools")
 
-        # Return an empty context - we're using the global connection
         yield {}
     finally:
-        # Clean up the global connection on shutdown
         global _qgis_connection
         if _qgis_connection:
             logger.info("Disconnecting from Qgis on shutdown")
@@ -252,11 +245,9 @@ def zoom_to_layer(ctx: Context, layer_id: str) -> str:
 
 
 @mcp.tool()
-def get_layer_features(ctx: Context, layer_id: str, limit: int = 3, include_geometry: bool = False) -> str:
-    """Retrieve features from a vector layer with an optional limit(max 3 items)."""
+def get_layer_features(ctx: Context, layer_id: str, limit: int = 10, include_geometry: bool = False) -> str:
+    """Retrieve features from a vector layer with an optional limit."""
     qgis = get_qgis_connection()
-    if limit > 3:
-        limit = 3  # Enforce a maximum limit of 3 to avoid large data transfers
     result = qgis.send_command("get_layer_features", {
                                "layer_id": layer_id, "limit": limit, "include_geometry": include_geometry})
     return json.dumps(result, indent=2)
@@ -296,6 +287,46 @@ def execute_code(ctx: Context, code: str) -> str:
     """Execute arbitrary PyQGIS code provided as a string."""
     qgis = get_qgis_connection()
     result = qgis.send_command("execute_code", {"code": code})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def set_layer_visibility(ctx: Context, layer_id: str, visible: bool) -> str:
+    """Toggle a layer's visibility on or off."""
+    qgis = get_qgis_connection()
+    result = qgis.send_command("set_layer_visibility", {"layer_id": layer_id, "visible": visible})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def filter_layer(ctx: Context, layer_id: str, expression: str = "") -> str:
+    """Set a subset filter (SQL WHERE clause) on a vector layer. Pass empty string to clear."""
+    qgis = get_qgis_connection()
+    result = qgis.send_command("filter_layer", {"layer_id": layer_id, "expression": expression})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_layer_fields(ctx: Context, layer_id: str) -> str:
+    """Get field metadata (name, type, length, precision) for a vector layer."""
+    qgis = get_qgis_connection()
+    result = qgis.send_command("get_layer_fields", {"layer_id": layer_id})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def group_layers(ctx: Context, name: str, layer_ids: list[str]) -> str:
+    """Create a layer group and move the specified layers into it."""
+    qgis = get_qgis_connection()
+    result = qgis.send_command("group_layers", {"name": name, "layer_ids": layer_ids})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def select_features(ctx: Context, layer_id: str, expression: str = "", mode: str = "set") -> str:
+    """Select features by expression, or clear selection if expression is empty."""
+    qgis = get_qgis_connection()
+    result = qgis.send_command("select_features", {"layer_id": layer_id, "expression": expression, "mode": mode})
     return json.dumps(result, indent=2)
 
 

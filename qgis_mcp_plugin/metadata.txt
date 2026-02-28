@@ -6,6 +6,7 @@ qgisMinimumVersion=3.0
 author=TuNombre
 email=tu_correo@example.com
 category=Plugins
+supportsQt6=True
 
 [about]
 about=Este plugin inicia un servidor MCP en QGIS para permitir la ejecución de comandos desde un LLM.
