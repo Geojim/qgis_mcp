@@ -5,6 +5,7 @@ QGIS MCP Client - Simple client to connect to the QGIS MCP server
 
 import socket
 import json
+import struct
 import argparse
 import sys
 
@@ -30,40 +31,41 @@ class QgisMCPClient:
             self.socket.close()
             self.socket = None
     
+    def _recv_exactly(self, n):
+        """Receive exactly n bytes from the socket, or raise on EOF."""
+        data = b''
+        while len(data) < n:
+            chunk = self.socket.recv(min(n - len(data), 65536))
+            if not chunk:
+                raise ConnectionError("Connection closed while reading response")
+            data += chunk
+        return data
+
     def send_command(self, command_type, params=None):
-        """Send a command to the server and get the response"""
+        """Send a command to the server and get the response.
+
+        Wire format: 4-byte big-endian unsigned length prefix + UTF-8 JSON body.
+        """
         if not self.socket:
             print("Not connected to server")
             return None
-        
+
         # Create command
         command = {
             "type": command_type,
             "params": params or {}
         }
-        
+
         try:
-            # Send the command
-            self.socket.sendall(json.dumps(command).encode('utf-8'))
-            
-            # Receive the response
-            response_data = b''
-            while True:
-                chunk = self.socket.recv(4096)
-                if not chunk:
-                    break
-                response_data += chunk
-                
-                # Try to decode as JSON to see if it's complete
-                try:
-                    json.loads(response_data.decode('utf-8'))
-                    break  # Valid JSON, we have the full message
-                except json.JSONDecodeError:
-                    continue  # Keep receiving
-            
-            # Parse and return the response
+            # Send the command, length-prefixed
+            payload = json.dumps(command).encode('utf-8')
+            self.socket.sendall(struct.pack('>I', len(payload)) + payload)
+
+            # Receive the response: read the 4-byte length, then the body
+            length = struct.unpack('>I', self._recv_exactly(4))[0]
+            response_data = self._recv_exactly(length)
             return json.loads(response_data.decode('utf-8'))
-            
+
         except Exception as e:
             print(f"Error sending command: {str(e)}")
             return None

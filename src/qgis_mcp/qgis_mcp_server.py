@@ -3,9 +3,11 @@
 QGIS MCP Client - Simple client to connect to the QGIS MCP server
 """
 
+import os
 import logging
 from contextlib import asynccontextmanager
 import socket
+import struct
 import json
 from typing import AsyncIterator, Dict, Any
 from mcp.server.fastmcp import FastMCP, Context
@@ -37,8 +39,21 @@ class QgisMCPServer:
             self.socket.close()
             self.socket = None
 
+    def _recv_exactly(self, n):
+        """Receive exactly n bytes from the socket, or raise on EOF."""
+        data = b''
+        while len(data) < n:
+            chunk = self.socket.recv(min(n - len(data), 65536))
+            if not chunk:
+                raise ConnectionError("Connection closed while reading response")
+            data += chunk
+        return data
+
     def send_command(self, command_type, params=None):
-        """Send a command to the server and get the response"""
+        """Send a command to the server and get the response.
+
+        Wire format: 4-byte big-endian unsigned length prefix + UTF-8 JSON body.
+        """
         if not self.socket:
             print("Not connected to server")
             return None
@@ -50,26 +65,16 @@ class QgisMCPServer:
         }
 
         try:
-            # Send the command
-            self.socket.sendall(json.dumps(command).encode('utf-8'))
-
             # Set a receive timeout to avoid infinite waiting.
             self.socket.settimeout(30)  # 30 seconds timeout
 
-            # Receive the response
-            response_data = b''
-            while True:
-                chunk = self.socket.recv(65536)  # Use a larger buffer
-                if not chunk:
-                    break
-                response_data += chunk
+            # Send the command, length-prefixed
+            payload = json.dumps(command).encode('utf-8')
+            self.socket.sendall(struct.pack('>I', len(payload)) + payload)
 
-                # Try to decode as JSON to see if it's complete
-                try:
-                    json.loads(response_data.decode('utf-8'))
-                    break  # Valid JSON, we have the full message
-                except json.JSONDecodeError:
-                    continue  # Keep receiving
+            # Receive the response: read the 4-byte length, then the body
+            length = struct.unpack('>I', self._recv_exactly(4))[0]
+            response_data = self._recv_exactly(length)
 
             # Restore to no timeout
             self.socket.settimeout(None)
@@ -88,7 +93,7 @@ class QgisMCPServer:
             return {"status": "error", "message": "Connection timed out"}
         except Exception as e:
             print(f"Error sending command: {str(e)}")
-            return {"status": "error", "message": str(e), "response_data": response_data.decode('utf-8', errors='replace')}
+            return {"status": "error", "message": str(e)}
 
 
 _qgis_connection = None
@@ -103,7 +108,7 @@ def get_qgis_connection():
         # Test if the connection is still alive with a simple ping
         try:
             # Just try to send a small message to check if the socket is still connected
-            _qgis_connection.sock.sendall(b'')
+            _qgis_connection.socket.sendall(b'')
             return _qgis_connection
         except Exception as e:
             # Connection is dead, close it and create a new one
@@ -116,7 +121,10 @@ def get_qgis_connection():
 
     # Create a new connection if needed
     if _qgis_connection is None:
-        _qgis_connection = QgisMCPServer(host="localhost", port=9876)
+        _qgis_connection = QgisMCPServer(
+            host=os.getenv("QGIS_MCP_HOST", "localhost"),
+            port=int(os.getenv("QGIS_MCP_PORT", "9876")),
+        )
         if not _qgis_connection.connect():
             logger.error("Failed to connect to Qgis")
             _qgis_connection = None

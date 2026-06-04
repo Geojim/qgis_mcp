@@ -3,6 +3,7 @@ import io
 import sys
 import json
 import socket
+import struct
 import traceback
 from qgis.core import *
 from qgis.gui import *
@@ -109,40 +110,46 @@ class QgisMCPServer(QObject):
             # Process existing connection
             if self.client:
                 try:
-                    # Try to receive data
+                    # Drain all data currently available on the non-blocking
+                    # socket into the buffer. Wire format: 4-byte big-endian
+                    # unsigned length prefix + UTF-8 JSON body.
+                    disconnected = False
                     try:
-                        data = self.client.recv(8192)
-                        if data:
-                            self.buffer += data
-                            # Try to process complete messages
-                            try:
-                                # Attempt to parse the buffer as JSON
-                                command = json.loads(
-                                    self.buffer.decode('utf-8'))
-                                # If successful, clear the buffer and process command
-                                self.buffer = b''
-                                response = self.execute_command(command)
-                                response_json = json.dumps(response)
-                                self.client.sendall(
-                                    response_json.encode('utf-8'))
-                            except json.JSONDecodeError:
-                                # Incomplete data, keep in buffer
-                                pass
-                        else:
-                            # Connection closed by client
-                            QgsMessageLog.logMessage(
-                                "Client disconnected", "QGIS MCP")
-                            self.client.close()
-                            self.client = None
-                            self.buffer = b''
+                        while True:
+                            chunk = self.client.recv(8192)
+                            if not chunk:
+                                disconnected = True
+                                break
+                            self.buffer += chunk
                     except BlockingIOError:
-                        pass  # No data available
-                    except Exception as e:
+                        pass  # No more data available right now
+
+                    if disconnected:
+                        # Connection closed by client
                         QgsMessageLog.logMessage(
-                            f"Error receiving data: {str(e)}", "QGIS MCP", Qgis.Warning)
+                            "Client disconnected", "QGIS MCP")
                         self.client.close()
                         self.client = None
                         self.buffer = b''
+                        return
+
+                    # Process every complete framed message in the buffer
+                    while len(self.buffer) >= 4:
+                        msg_len = struct.unpack('>I', self.buffer[:4])[0]
+                        if len(self.buffer) < 4 + msg_len:
+                            break  # Incomplete message, wait for more data
+                        message = self.buffer[4:4 + msg_len]
+                        self.buffer = self.buffer[4 + msg_len:]
+                        try:
+                            command = json.loads(message.decode('utf-8'))
+                            response = self.execute_command(command)
+                        except Exception as e:
+                            QgsMessageLog.logMessage(
+                                f"Error processing command: {str(e)}", "QGIS MCP", Qgis.Warning)
+                            response = {"status": "error", "message": str(e)}
+                        response_json = json.dumps(response).encode('utf-8')
+                        self.client.sendall(
+                            struct.pack('>I', len(response_json)) + response_json)
 
                 except Exception as e:
                     QgsMessageLog.logMessage(
