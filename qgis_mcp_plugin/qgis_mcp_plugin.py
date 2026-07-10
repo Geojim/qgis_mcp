@@ -14,7 +14,7 @@ try:
 except ImportError:
     HAS_QVARIANT = False
 from qgis.PyQt.QtWidgets import QAction, QDockWidget, QVBoxLayout, QLabel, QPushButton, QSpinBox, QWidget
-from qgis.PyQt.QtGui import QIcon, QColor
+from qgis.PyQt.QtGui import QIcon, QColor, QImage, QPainter
 from qgis.utils import active_plugins
 
 # Qt5/Qt6 compatible enum values
@@ -553,7 +553,10 @@ class QgisMCPServer(QObject):
         project = QgsProject.instance()
 
         if project.read(path):
-            self.iface.mapCanvas().refresh()
+            # Bridge stability: do NOT force a canvas refresh through the bridge --
+            # on ECW raster + live MSSQL/ODBC projects a bridge-triggered repaint
+            # hard-crashes QGIS (NCS::CView / ODBC driver teardown). QGIS repaints
+            # the canvas on its own event loop after the project loads.
             return {
                 "loaded": path,
                 "layer_count": len(project.mapLayers())
@@ -575,7 +578,9 @@ class QgisMCPServer(QObject):
             project.clear()
 
         project.setFileName(path)
-        self.iface.mapCanvas().refresh()
+        # Bridge stability: no bridge-triggered canvas refresh here (see load_project) --
+        # a fresh/empty project has nothing to repaint and the forced refresh is a
+        # documented crash trigger on heavy ECW+ODBC projects.
 
         # Save the project
         if project.write():
@@ -593,7 +598,10 @@ class QgisMCPServer(QObject):
         if node is None:
             raise Exception(f"Layer tree node not found: {layer_id}")
         node.setItemVisibilityChecked(visible)
-        self.iface.mapCanvas().refresh()
+        # Bridge stability: repaint ONLY the toggled layer, never force a full
+        # mapCanvas().refresh() through the bridge -- that hard-crashes QGIS on
+        # ECW raster + live MSSQL/ODBC projects (NCS::CView / ODBC driver teardown).
+        layer.triggerRepaint()
         return {"layer_id": layer_id, "layer_name": layer.name(), "visible": visible}
 
     def filter_layer(self, layer_id, expression="", **kwargs):
@@ -693,32 +701,83 @@ class QgisMCPServer(QObject):
             "selected_ids": list(selected_ids[:100]),
         }
 
-    def render_map(self, path, width=800, height=600, **kwargs):
-        """Render the current map view to an image"""
+    def render_map(self, path, width=800, height=600, layer_ids=None,
+                   extent=None, **kwargs):
+        """Render the map to an image off-screen, without touching the canvas.
+
+        Bridge stability (learned the hard way): the previous implementation used
+        the MULTI-threaded QgsMapRendererParallelJob and rendered every checked
+        layer. On heavy projects (ECW raster imagery + live MSSQL/ODBC layers,
+        e.g. the CBB "Aquila" workspace) the ECW driver mutex (NCS::CView) is
+        contended across worker threads and QGIS hard-crashes with an access
+        violation during driver teardown -- uncatchable from Python.
+
+        This version renders SINGLE-THREADED via QgsMapRendererCustomPainterJob
+        painting onto an off-screen QImage, and never calls mapCanvas().refresh().
+
+        Args:
+            path:      output image path.
+            width/height: output size in pixels.
+            layer_ids: optional list of layer IDs to render. When provided, ONLY
+                       those layers are drawn -- pass a vector-only subset to
+                       exclude ECW rasters / live ODBC layers from the render.
+                       When omitted, falls back to the currently checked layers
+                       (WARNING: that fallback can still be heavy and may include
+                       ECW/ODBC layers -- prefer passing layer_ids on such projects).
+            extent:    optional [xmin, ymin, xmax, ymax] in the project CRS. When
+                       omitted, the current canvas extent is read (read-only; safe).
+        """
         try:
+            project = QgsProject.instance()
+
+            # Resolve the layers to render.
+            if layer_ids:
+                layers = []
+                missing = []
+                for lid in layer_ids:
+                    lyr = project.mapLayer(lid)
+                    if lyr is None:
+                        missing.append(lid)
+                    else:
+                        layers.append(lyr)
+                if missing:
+                    raise Exception(f"Layer(s) not found: {missing}")
+            else:
+                # Fallback: currently checked (visible) layers. Can be heavy.
+                layers = project.layerTreeRoot().checkedLayers()
+
             # Create map settings
             ms = QgsMapSettings()
-
-            # Set layers to render (only visible layers)
-            layers = QgsProject.instance().layerTreeRoot().checkedLayers()
             ms.setLayers(layers)
 
-            # Set map canvas properties
-            rect = self.iface.mapCanvas().extent()
+            # Extent: use provided bbox, else READ (not refresh) the canvas extent.
+            if extent:
+                xmin, ymin, xmax, ymax = extent
+                rect = QgsRectangle(xmin, ymin, xmax, ymax)
+            else:
+                rect = self.iface.mapCanvas().extent()
             ms.setExtent(rect)
+
             ms.setOutputSize(QSize(width, height))
             ms.setBackgroundColor(QColor(255, 255, 255))
             ms.setOutputDpi(96)
+            # Match the destination CRS to the project so coordinates line up.
+            ms.setDestinationCrs(project.crs())
 
-            # Create the render
-            render = QgsMapRendererParallelJob(ms)
+            # Off-screen image to paint onto.
+            img = QImage(QSize(width, height), QImage.Format_ARGB32_Premultiplied)
+            img.fill(QColor(255, 255, 255))
 
-            # Start rendering
-            render.start()
-            render.waitForFinished()
+            painter = QPainter(img)
+            try:
+                # Single-threaded custom-painter job -- no worker threads, so the
+                # ECW driver mutex is not contended across threads.
+                render = QgsMapRendererCustomPainterJob(ms, painter)
+                render.start()
+                render.waitForFinished()
+            finally:
+                painter.end()
 
-            # Get the image and save
-            img = render.renderedImage()
             if img.save(path):
                 return {
                     "rendered": True,

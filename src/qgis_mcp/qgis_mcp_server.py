@@ -282,11 +282,29 @@ def save_project(ctx: Context, path: str = None) -> str:
 
 
 @mcp.tool()
-def render_map(ctx: Context, path: str, width: int = 800, height: int = 600) -> str:
-    """Render the current map view to an image file with the specified dimensions."""
+def render_map(ctx: Context, path: str, width: int = 800, height: int = 600,
+               layer_ids: list = None, extent: list = None) -> str:
+    """Render the map to an image file, off-screen and single-threaded (crash-safe).
+
+    On heavy projects (ECW raster imagery + live MSSQL/ODBC layers) rendering ALL
+    checked layers can hard-crash QGIS via the ECW driver mutex. Pass layer_ids to
+    render only a chosen subset (e.g. vector layers only, excluding ECW/ODBC).
+
+    Args:
+        path:      output image path.
+        width/height: output size in pixels.
+        layer_ids: optional list of layer IDs to render ONLY those layers. When
+                   omitted, falls back to currently checked layers (can be heavy).
+        extent:    optional [xmin, ymin, xmax, ymax] in project CRS; defaults to
+                   the current canvas extent.
+    """
     qgis = get_qgis_connection()
-    result = qgis.send_command(
-        "render_map", {"path": path, "width": width, "height": height})
+    params = {"path": path, "width": width, "height": height}
+    if layer_ids is not None:
+        params["layer_ids"] = layer_ids
+    if extent is not None:
+        params["extent"] = extent
+    result = qgis.send_command("render_map", params)
     return json.dumps(result, indent=2)
 
 
