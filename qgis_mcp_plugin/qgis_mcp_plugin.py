@@ -4,6 +4,7 @@ import sys
 import json
 import socket
 import struct
+import time
 import traceback
 from qgis.core import *
 from qgis.gui import *
@@ -32,6 +33,44 @@ except AttributeError:
     _RasterLayerType = QgsMapLayer.RasterLayer
 
 
+def _find_group_by_path(path):
+    """Resolve a '/'-separated group path (e.g. 'Seams/GM') to its tree node.
+
+    Path-based (not findGroup by bare name) so same-named groups under
+    different parents resolve unambiguously. Returns None if not found.
+    """
+    node = QgsProject.instance().layerTreeRoot()
+    for part in [p for p in str(path).split("/") if p]:
+        node = next(
+            (c for c in node.children()
+             if isinstance(c, QgsLayerTreeGroup) and c.name() == part),
+            None)
+        if node is None:
+            return None
+    return node
+
+
+def _iter_group_paths(node=None, prefix=""):
+    """Yield (path, tree_node) for every group in the layer tree, depth-first."""
+    if node is None:
+        node = QgsProject.instance().layerTreeRoot()
+    for child in node.children():
+        if isinstance(child, QgsLayerTreeGroup):
+            path = f"{prefix}/{child.name()}" if prefix else child.name()
+            yield path, child
+            yield from _iter_group_paths(child, path)
+
+
+def _check_with_ancestors(node):
+    """Check a tree node's visibility box, and its ancestor groups' boxes too,
+    so the node actually becomes visible on the canvas."""
+    node.setItemVisibilityChecked(True)
+    parent = node.parent()
+    while parent is not None and parent.parent() is not None:  # stop at root
+        parent.setItemVisibilityChecked(True)
+        parent = parent.parent()
+
+
 class QgisMCPServer(QObject):
     """Server class to handle socket connections and execute QGIS commands"""
 
@@ -45,6 +84,10 @@ class QgisMCPServer(QObject):
         self.client = None
         self.buffer = b''
         self.timer = None
+        # Async job store for submit_code/poll_job. Completed jobs are kept
+        # until pruned so a client that timed out can still fetch the result.
+        self.jobs = {}
+        self._job_counter = 0
 
     def start(self):
         """Start the server"""
@@ -140,6 +183,7 @@ class QgisMCPServer(QObject):
                             break  # Incomplete message, wait for more data
                         message = self.buffer[4:4 + msg_len]
                         self.buffer = self.buffer[4 + msg_len:]
+                        command = None
                         try:
                             command = json.loads(message.decode('utf-8'))
                             response = self.execute_command(command)
@@ -147,6 +191,11 @@ class QgisMCPServer(QObject):
                             QgsMessageLog.logMessage(
                                 f"Error processing command: {str(e)}", "QGIS MCP", Qgis.Warning)
                             response = {"status": "error", "message": str(e)}
+                        # Echo the request id so the client can correlate
+                        # replies with requests and discard stale frames left
+                        # over from calls that timed out client-side.
+                        if isinstance(command, dict) and command.get("id") is not None:
+                            response["id"] = command["id"]
                         response_json = json.dumps(response).encode('utf-8')
                         self.client.sendall(
                             struct.pack('>I', len(response_json)) + response_json)
@@ -190,6 +239,14 @@ class QgisMCPServer(QObject):
                 "get_layer_fields": self.get_layer_fields,
                 "group_layers": self.group_layers,
                 "select_features": self.select_features,
+                "submit_code": self.submit_code,
+                "poll_job": self.poll_job,
+                "get_layer_tree": self.get_layer_tree,
+                "set_node_visibility": self.set_node_visibility,
+                "move_node": self.move_node,
+                "add_group": self.add_group,
+                "get_extent": self.get_extent,
+                "set_extent": self.set_extent,
             }
 
             handler = handlers.get(cmd_type)
@@ -701,6 +758,187 @@ class QgisMCPServer(QObject):
             "selected_ids": list(selected_ids[:100]),
         }
 
+    # --- Async job API (submit_code / poll_job) ---
+
+    def submit_code(self, code, **kwargs):
+        """Submit PyQGIS code as an async job; returns a job id immediately.
+
+        The code runs on the Qt main thread on the next event-loop pass, so
+        this reply is sent before execution starts and the client's socket
+        timeout never races a long-running script. Poll with poll_job.
+        """
+        self._job_counter += 1
+        job_id = f"job_{self._job_counter}"
+        self.jobs[job_id] = {"status": "pending", "result": None,
+                             "submitted": time.time()}
+        QTimer.singleShot(0, lambda: self._run_job(job_id, code))
+        # Prune oldest finished jobs so the store can't grow unbounded.
+        finished = [jid for jid, j in self.jobs.items()
+                    if j["status"] in ("done", "error")]
+        for jid in finished[:max(0, len(self.jobs) - 50)]:
+            del self.jobs[jid]
+        return {"job_id": job_id, "status": "pending"}
+
+    def _run_job(self, job_id, code):
+        job = self.jobs.get(job_id)
+        if job is None:
+            return
+        job["status"] = "running"
+        result = self.execute_code(code)
+        job["result"] = result
+        job["status"] = "done" if result.get("executed") else "error"
+
+    def poll_job(self, job_id, **kwargs):
+        """Get the status (and, when finished, the result) of a submitted job."""
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise Exception(f"Unknown job id: {job_id}")
+        response = {"job_id": job_id, "status": job["status"]}
+        if job["status"] in ("done", "error"):
+            response["result"] = job["result"]
+        return response
+
+    # --- Layer tree API ---
+
+    def _serialize_tree_node(self, node):
+        info = {
+            "name": node.name(),
+            "checked": node.itemVisibilityChecked(),
+            "visible": node.isVisible(),
+            "expanded": node.isExpanded(),
+        }
+        if isinstance(node, QgsLayerTreeGroup):
+            info["type"] = "group"
+            info["children"] = [self._serialize_tree_node(c) for c in node.children()]
+        else:
+            info["type"] = "layer"
+            info["layer_id"] = node.layerId()
+        return info
+
+    def get_layer_tree(self, **kwargs):
+        """Get the nested layer tree (groups + layers, visibility/expanded state)."""
+        root = QgsProject.instance().layerTreeRoot()
+        return {"tree": [self._serialize_tree_node(c) for c in root.children()]}
+
+    def _find_tree_node(self, layer_id=None, group_path=None):
+        """Resolve a tree node from either a layer id or a group path."""
+        root = QgsProject.instance().layerTreeRoot()
+        if layer_id:
+            node = root.findLayer(layer_id)
+            if node is None:
+                raise Exception(f"Layer tree node not found: {layer_id}")
+            return node
+        if group_path:
+            node = _find_group_by_path(group_path)
+            if node is None:
+                raise Exception(f"Group not found: {group_path}")
+            return node
+        raise Exception("Provide either layer_id or group_path")
+
+    def set_node_visibility(self, visible, layer_id=None, group_path=None,
+                            check_ancestors=True, **kwargs):
+        """Check/uncheck a layer or group node in the layer tree.
+
+        When enabling with check_ancestors=True (default), ancestor groups are
+        checked too so the node actually becomes visible on the canvas.
+        No bridge-triggered canvas refresh (crash-safe on ECW+ODBC projects).
+        """
+        node = self._find_tree_node(layer_id, group_path)
+        if visible and check_ancestors:
+            _check_with_ancestors(node)
+        else:
+            node.setItemVisibilityChecked(visible)
+        return {
+            "node": group_path or layer_id,
+            "checked": node.itemVisibilityChecked(),
+            "visible": node.isVisible(),
+        }
+
+    def move_node(self, layer_id=None, group_path=None, target_group_path=None,
+                  index=-1, **kwargs):
+        """Move a layer or group into another group (or the root).
+
+        Args:
+            layer_id / group_path: the node to move (one of).
+            target_group_path: destination group path; None/empty = root.
+            index: insert position in the destination (-1 = append). The index
+                   applies before the original node is removed.
+        """
+        node = self._find_tree_node(layer_id, group_path)
+        root = QgsProject.instance().layerTreeRoot()
+        if target_group_path:
+            target = _find_group_by_path(target_group_path)
+            if target is None:
+                raise Exception(f"Target group not found: {target_group_path}")
+        else:
+            target = root
+        # A group must not be moved into itself or one of its descendants.
+        probe = target
+        while probe is not None:
+            if probe is node:
+                raise Exception(
+                    "Cannot move a group into itself or its own descendant")
+            probe = probe.parent()
+        clone = node.clone()
+        if 0 <= index <= len(target.children()):
+            target.insertChildNode(index, clone)
+        else:
+            target.addChildNode(clone)
+        node.parent().removeChildNode(node)
+        return {
+            "moved": clone.name(),
+            "to": target_group_path or "<root>",
+            "index": index,
+        }
+
+    def add_group(self, name, parent_path=None, index=-1, **kwargs):
+        """Create a layer-tree group under parent_path (root when omitted)."""
+        if parent_path:
+            parent = _find_group_by_path(parent_path)
+            if parent is None:
+                raise Exception(f"Parent group not found: {parent_path}")
+        else:
+            parent = QgsProject.instance().layerTreeRoot()
+        if 0 <= index <= len(parent.children()):
+            group = parent.insertGroup(index, name)
+        else:
+            group = parent.addGroup(name)
+        path = f"{parent_path}/{name}" if parent_path else name
+        return {"group": group.name(), "path": path}
+
+    # --- Canvas extent ---
+
+    def get_extent(self, **kwargs):
+        """Get the current canvas extent (read-only; safe on any project)."""
+        canvas = self.iface.mapCanvas()
+        e = canvas.extent()
+        return {
+            "xmin": e.xMinimum(), "ymin": e.yMinimum(),
+            "xmax": e.xMaximum(), "ymax": e.yMaximum(),
+            "crs": QgsProject.instance().crs().authid(),
+            "scale": canvas.scale(),
+            "width_px": canvas.width(), "height_px": canvas.height(),
+        }
+
+    def set_extent(self, xmin, ymin, xmax, ymax, refresh=True, **kwargs):
+        """Set the canvas extent (zoom) to the given bbox in project CRS.
+
+        Bridge stability: pass refresh=False on heavy ECW+ODBC projects — a
+        bridge-triggered canvas refresh is a documented crash trigger there;
+        without it QGIS repaints on its own next canvas interaction.
+        """
+        canvas = self.iface.mapCanvas()
+        canvas.setExtent(QgsRectangle(xmin, ymin, xmax, ymax))
+        if refresh:
+            canvas.refresh()
+        e = canvas.extent()  # canvas adjusts the bbox to its aspect ratio
+        return {
+            "xmin": e.xMinimum(), "ymin": e.yMinimum(),
+            "xmax": e.xMaximum(), "ymax": e.yMaximum(),
+            "scale": canvas.scale(),
+            "refreshed": bool(refresh),
+        }
+
     def render_map(self, path, width=800, height=600, layer_ids=None,
                    extent=None, **kwargs):
         """Render the map to an image off-screen, without touching the canvas.
@@ -769,6 +1007,7 @@ class QgisMCPServer(QObject):
             img.fill(QColor(255, 255, 255))
 
             painter = QPainter(img)
+            t0 = time.perf_counter()
             try:
                 # Single-threaded custom-painter job -- no worker threads, so the
                 # ECW driver mutex is not contended across threads.
@@ -777,19 +1016,97 @@ class QgisMCPServer(QObject):
                 render.waitForFinished()
             finally:
                 painter.end()
+            render_seconds = time.perf_counter() - t0
 
             if img.save(path):
                 return {
                     "rendered": True,
                     "path": path,
                     "width": width,
-                    "height": height
+                    "height": height,
+                    "layer_count": len(layers),
+                    "render_seconds": round(render_seconds, 3)
                 }
             else:
                 raise Exception(f"Failed to save rendered image to {path}")
 
         except Exception as e:
             raise Exception(f"Render error: {str(e)}")
+
+
+class GroupLocatorFilter(QgsLocatorFilter):
+    """Locator filter searching layer-tree GROUP names (prefix 'grp').
+
+    QGIS's built-in 'l' filter only searches layer names; this one searches
+    group paths and toggles the activated group's visibility, checking
+    ancestor groups when enabling so the group actually shows.
+
+    Threading contract (gotchas from live prototyping):
+    - prepare() runs on the MAIN thread and must return a list of strings
+      (QStringList) — returning None raises "TypeError: invalid result from
+      prepare()". The group snapshot is built here.
+    - fetchResults() runs on a WORKER thread and must only touch the snapshot.
+    - triggerResult() runs on the main thread again.
+    - Non-core filters need a prefix of >= 3 chars ('grp', not 'g') — shorter
+      prefixes are reserved for core filters and silently dropped. Users can
+      rebind a shorter prefix in Settings > Options > Locator.
+    """
+
+    def __init__(self, iface):
+        super().__init__()
+        self.iface = iface
+        self._groups = []
+
+    def clone(self):
+        return GroupLocatorFilter(self.iface)
+
+    def name(self):
+        return "qgis_mcp_groups"
+
+    def displayName(self):
+        return "Layer Tree Groups"
+
+    def prefix(self):
+        return "grp"
+
+    def prepare(self, string, context):
+        # Main thread: snapshot (path, checked) for the worker thread.
+        self._groups = [(path, node.itemVisibilityChecked())
+                        for path, node in _iter_group_paths()]
+        return []  # autocomplete suggestions; must be a QStringList, not None
+
+    def fetchResults(self, string, context, feedback):
+        needle = (string or "").lower()
+        for path, checked in self._groups:
+            if feedback.isCanceled():
+                return
+            if needle and needle not in path.lower():
+                continue
+            result = QgsLocatorResult()
+            result.filter = self
+            result.displayString = path
+            result.description = ("visible — activate to hide" if checked
+                                  else "hidden — activate to show")
+            result.score = 1.0 if path.lower().startswith(needle) else 0.5
+            try:
+                result.setUserData(path)  # QGIS 3.34+
+            except AttributeError:
+                result.userData = path
+            self.resultFetched.emit(result)
+
+    def triggerResult(self, result):
+        data = getattr(result, "userData", None)
+        if callable(data):  # newer API exposes userData() as a getter
+            data = data()
+        node = _find_group_by_path(data) if data else None
+        if node is None:
+            QgsMessageLog.logMessage(
+                f"Group no longer exists: {data}", "QGIS MCP", Qgis.Warning)
+            return
+        if node.itemVisibilityChecked():
+            node.setItemVisibilityChecked(False)
+        else:
+            _check_with_ancestors(node)
 
 
 class QgisMCPDockWidget(QDockWidget):
@@ -872,6 +1189,7 @@ class QgisMCPPlugin:
         self.iface = iface
         self.dock_widget = None
         self.action = None
+        self.locator_filter = None
 
     def initGui(self):
         """Initialize GUI"""
@@ -886,6 +1204,11 @@ class QgisMCPPlugin:
         # Add to plugins menu and toolbar
         self.iface.addPluginToMenu("QGIS MCP", self.action)
         self.iface.addToolBarIcon(self.action)
+
+        # Group locator filter ('grp <text>' in the locator bar) — registered
+        # here, independent of the MCP server, so it survives QGIS restarts.
+        self.locator_filter = GroupLocatorFilter(self.iface)
+        self.iface.registerLocatorFilter(self.locator_filter)
 
     def toggle_dock(self, checked):
         """Toggle the dock widget"""
@@ -911,6 +1234,11 @@ class QgisMCPPlugin:
 
     def unload(self):
         """Unload plugin"""
+        # Deregister the locator filter (this also deletes it)
+        if self.locator_filter:
+            self.iface.deregisterLocatorFilter(self.locator_filter)
+            self.locator_filter = None
+
         # Stop server if running
         if self.dock_widget:
             self.dock_widget.stop_server()

@@ -111,14 +111,29 @@ Once the config file has been set on Claude, and the server is running on QGIS, 
 - `get_project_info` - Get current project information
 - `add_vector_layer` - Add a vector layer to the project
 - `add_raster_layer` - Add a raster layer to the project
-- `get_layers` - Retrieve all layers in the current project
+- `get_layers` - Retrieve all layers in the current project (flat list)
+- `get_layer_tree` - Get the nested layer tree (groups + layers with visibility/expanded state)
+- `set_node_visibility` - Check/uncheck a layer or group in the layer tree (optionally checking ancestors)
+- `move_node` - Move a layer or group into another group (or the root)
+- `add_group` - Create a layer-tree group
+- `group_layers` - Create a group and move layers into it
+- `set_layer_visibility` - Toggle a layer's visibility
+- `filter_layer` - Set a subset filter (SQL WHERE clause) on a vector layer
+- `get_layer_fields` - Get field metadata for a vector layer
+- `select_features` - Select features by expression
 - `remove_layer` - Remove a layer from the project by its ID
 - `zoom_to_layer` - Zoom to the extent of a specified layer
+- `get_extent` / `set_extent` - Get/set the canvas extent (bbox in project CRS)
 - `get_layer_features` - Retrieve features from a vector layer with an optional limit
 - `execute_processing` - Execute a processing algorithm with the given parameters
 - `save_project` - Save the current project to the given path
-- `render_map` - Render the current map view to an image file
+- `render_map` - Render the map to an image file, off-screen and crash-safe; reports `render_seconds`
 - `execute_code` - Execute arbitrary PyQGIS code provided as a string
+- `submit_code` / `poll_job` - Run long PyQGIS code as an async job (submit returns a job id immediately; poll for the result)
+
+Long-running tools (`execute_code`, `execute_processing`, `render_map`, `load_project`) accept an optional `timeout` in seconds (default 30, or the `QGIS_MCP_TIMEOUT` env var). Requests are correlated with responses via ids, and the client transparently reconnects if QGIS was restarted.
+
+The plugin also registers a locator filter: type `grp <text>` in the QGIS locator bar (Ctrl+K) to search layer-tree **group** names and toggle a group's visibility on activation.
 
 ### Example Commands
 
