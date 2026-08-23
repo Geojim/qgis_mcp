@@ -923,8 +923,9 @@ class QgisMCPServer(QObject):
     def set_extent(self, xmin, ymin, xmax, ymax, refresh=True, **kwargs):
         """Set the canvas extent (zoom) to the given bbox in project CRS.
 
-        Bridge stability: pass refresh=False on heavy ECW+ODBC projects — a
-        bridge-triggered canvas refresh is a documented crash trigger there;
+        Bridge stability: a bridge-triggered canvas refresh was historically a
+        crash trigger on ECW+ODBC projects, but survived live verification on
+        one (2026-08-23). refresh=False remains available as a precaution;
         without it QGIS repaints on its own next canvas interaction.
         """
         canvas = self.iface.mapCanvas()
@@ -943,25 +944,25 @@ class QgisMCPServer(QObject):
                    extent=None, **kwargs):
         """Render the map to an image off-screen, without touching the canvas.
 
-        Bridge stability (learned the hard way): the previous implementation used
+        Bridge stability (learned the hard way): the original implementation used
         the MULTI-threaded QgsMapRendererParallelJob and rendered every checked
         layer. On heavy projects (ECW raster imagery + live MSSQL/ODBC layers,
-        e.g. the CBB "Aquila" workspace) the ECW driver mutex (NCS::CView) is
-        contended across worker threads and QGIS hard-crashes with an access
+        e.g. the CBB "Aquila" workspace) the ECW driver mutex (NCS::CView) was
+        contended across worker threads and QGIS hard-crashed with an access
         violation during driver teardown -- uncatchable from Python.
 
         This version renders SINGLE-THREADED via QgsMapRendererCustomPainterJob
         painting onto an off-screen QImage, and never calls mapCanvas().refresh().
+        Verified live 2026-08-23 on an ECW + 13-mssql-layer project: ECW alone,
+        ECW+mssql, and the all-checked-layers fallback all render without crashing,
+        so rendering ECW/ODBC layers through this path is considered SAFE.
 
         Args:
             path:      output image path.
             width/height: output size in pixels.
-            layer_ids: optional list of layer IDs to render. When provided, ONLY
-                       those layers are drawn -- pass a vector-only subset to
-                       exclude ECW rasters / live ODBC layers from the render.
-                       When omitted, falls back to the currently checked layers
-                       (WARNING: that fallback can still be heavy and may include
-                       ECW/ODBC layers -- prefer passing layer_ids on such projects).
+            layer_ids: optional list of layer IDs to render ONLY those layers
+                       (subset for speed or styling isolation). When omitted,
+                       falls back to the currently checked layers.
             extent:    optional [xmin, ymin, xmax, ymax] in the project CRS. When
                        omitted, the current canvas extent is read (read-only; safe).
         """

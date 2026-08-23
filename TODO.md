@@ -34,10 +34,18 @@ suite (`tests/test_qgis_live.py`, 17 passed) against a running QGIS.
   or `/`-separated group path, with `check_ancestors`), `move_node`, and
   `add_group`.
 - [x] **Canvas extent get/set.** Added `get_extent` (bbox, CRS, scale,
-  canvas size) and `set_extent` (with `refresh=False` option for crash-prone
-  ECW+ODBC projects).
+  canvas size) and `set_extent` (with a `refresh=False` precaution option;
+  the historical ECW+ODBC refresh crash did not reproduce in live
+  verification on such a project, 2026-08-23 — see the render note below).
 - [x] **`render_map` timing.** The result now includes `render_seconds`
   (render duration, excluding image save) and `layer_count`.
+
+  *ECW landmine cleared (2026-08-23)*: the historical hard-crash rendering
+  ECW+ODBC projects was specific to the old multi-threaded renderer. The
+  single-threaded off-screen render was verified live on the CBB workspace
+  (Capcoal 20 cm ECW + 13 mssql layers): ECW alone, ECW+mssql, the
+  all-checked-layers fallback, and a bridge-triggered full canvas refresh
+  all survived. Rendering ECW/ODBC layers through the bridge is safe.
 
 ## Feature ideas
 

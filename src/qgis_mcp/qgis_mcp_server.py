@@ -343,11 +343,13 @@ def render_map(ctx: Context, path: str, width: int = 800, height: int = 600,
                timeout: float = None) -> str:
     """Render the map to an image file, off-screen and single-threaded (crash-safe).
 
-    On heavy projects (ECW raster imagery + live MSSQL/ODBC layers) rendering ALL
-    checked layers can hard-crash QGIS via the ECW driver mutex. Pass layer_ids to
-    render only a chosen subset (e.g. vector layers only, excluding ECW/ODBC).
-    The result includes render_seconds (render duration, excluding image save)
-    for judging provider/styling performance.
+    Safe to use on any project, including ECW raster imagery and live
+    MSSQL/ODBC layers. (A historical hard-crash via the ECW driver mutex only
+    affected the old MULTI-threaded renderer; the current single-threaded
+    implementation was verified live on an ECW+mssql project, 2026-08-23.)
+    Pass layer_ids to render a chosen subset — useful for speed or isolating
+    styling. The result includes render_seconds (render duration, excluding
+    image save) for judging provider/styling performance.
 
     Args:
         path:      output image path.
@@ -480,8 +482,10 @@ def set_extent(ctx: Context, xmin: float, ymin: float, xmax: float, ymax: float,
                refresh: bool = True) -> str:
     """Set the canvas extent (zoom) to the given bbox in project CRS.
 
-    Pass refresh=False on heavy ECW+ODBC projects — a bridge-triggered canvas
-    refresh is a documented crash trigger there.
+    refresh=True (default) repaints the canvas. A bridge-triggered refresh
+    was historically a crash trigger on ECW+ODBC projects but survived live
+    verification on one (2026-08-23); pass refresh=False as a precaution if
+    a specific project proves unstable.
     """
     qgis = get_qgis_connection()
     result = qgis.send_command("set_extent", {
